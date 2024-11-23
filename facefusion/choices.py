@@ -1,64 +1,132 @@
-import logging
-from typing import List, Sequence
+from functools import lru_cache
 
-from facefusion.common_helper import create_float_range, create_int_range
-from facefusion.typing import Angle, ExecutionProviderSet, FaceDetectorSet, FaceLandmarkerModel, FaceMaskRegion, FaceMaskType, FaceSelectorMode, FaceSelectorOrder, Gender, JobStatus, LogLevelSet, OutputAudioEncoder, OutputVideoEncoder, OutputVideoPreset, Race, Score, TempFrameFormat, UiWorkflow, VideoMemoryStrategy
+import cv2
+import numpy
+from tqdm import tqdm
 
-video_memory_strategies : List[VideoMemoryStrategy] = [ 'strict', 'moderate', 'tolerant' ]
+from facefusion import inference_manager, state_manager, wording
+from facefusion.download import conditional_download_hashes, conditional_download_sources
+from facefusion.filesystem import resolve_relative_path
+from facefusion.thread_helper import conditional_thread_semaphore
+from facefusion.typing import Fps, InferencePool, ModelOptions, ModelSet, VisionFrame
+from facefusion.vision import count_video_frame_total, detect_video_fps, get_video_frame, read_image
 
-face_detector_set : FaceDetectorSet =\
+MODEL_SET : ModelSet =\
 {
-	'many': [ '640x640' ],
-	'retinaface': [ '160x160', '320x320', '480x480', '512x512', '640x640' ],
-	'scrfd': [ '160x160', '320x320', '480x480', '512x512', '640x640' ],
-	'yoloface': [ '640x640' ]
+  'open_nsfw':
+  {
+    'hashes':
+    {
+      'content_analyser':
+      {
+        'url': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/open_nsfw.hash',
+        'path': resolve_relative_path('../.assets/models/open_nsfw.hash')
+      }
+    },
+    'sources':
+    {
+      'content_analyser':
+      {
+        'url': 'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/open_nsfw.onnx',
+        'path': resolve_relative_path('../.assets/models/open_nsfw.onnx')
+      }
+    },
+    'size': (224, 224),
+    'mean': [ 104, 117, 123 ]
+  }
 }
-face_landmarker_models : List[FaceLandmarkerModel] = [ 'many', '2dfan4', 'peppa_wutz' ]
-face_selector_modes : List[FaceSelectorMode] = [ 'many', 'one', 'reference' ]
-face_selector_orders : List[FaceSelectorOrder] = [ 'left-right', 'right-left', 'top-bottom', 'bottom-top', 'small-large', 'large-small', 'best-worst', 'worst-best' ]
-face_selector_genders : List[Gender] = ['female', 'male']
-face_selector_races : List[Race] = ['white', 'black', 'latino', 'asian', 'indian', 'arabic']
-face_mask_types : List[FaceMaskType] = [ 'box', 'occlusion', 'region' ]
-face_mask_regions : List[FaceMaskRegion] = [ 'skin', 'left-eyebrow', 'right-eyebrow', 'left-eye', 'right-eye', 'glasses', 'nose', 'mouth', 'upper-lip', 'lower-lip' ]
-temp_frame_formats : List[TempFrameFormat] = [ 'bmp', 'jpg', 'png' ]
-output_audio_encoders : List[OutputAudioEncoder] = [ 'aac', 'libmp3lame', 'libopus', 'libvorbis' ]
-output_video_encoders : List[OutputVideoEncoder] = [ 'libx264', 'libx265', 'libvpx-vp9', 'h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf', 'h264_videotoolbox', 'hevc_videotoolbox' ]
-output_video_presets : List[OutputVideoPreset] = [ 'ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow' ]
+PROBABILITY_LIMIT = 0.8
+RATE_LIMIT = 10
+STREAM_COUNTER = 0
 
-image_template_sizes : List[float] = [ 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 3.5, 4 ]
-video_template_sizes : List[int] = [ 240, 360, 480, 540, 720, 1080, 1440, 2160, 4320 ]
 
-log_level_set : LogLevelSet =\
-{
-	'error': logging.ERROR,
-	'warn': logging.WARNING,
-	'info': logging.INFO,
-	'debug': logging.DEBUG
-}
+def get_inference_pool() -> InferencePool:
+  model_sources = get_model_options().get('sources')
+  return inference_manager.get_inference_pool(__name__, model_sources)
 
-execution_provider_set : ExecutionProviderSet =\
-{
-	'cpu': 'CPUExecutionProvider',
-	'coreml': 'CoreMLExecutionProvider',
-	'cuda': 'CUDAExecutionProvider',
-	'directml': 'DmlExecutionProvider',
-	'openvino': 'OpenVINOExecutionProvider',
-	'rocm': 'ROCMExecutionProvider',
-	'tensorrt': 'TensorrtExecutionProvider'
-}
 
-ui_workflows : List[UiWorkflow] = [ 'instant_runner', 'job_runner', 'job_manager' ]
-job_statuses : List[JobStatus] = [ 'drafted', 'queued', 'completed', 'failed' ]
+def clear_inference_pool() -> None:
+  inference_manager.clear_inference_pool(__name__)
 
-execution_thread_count_range : Sequence[int] = create_int_range(1, 32, 1)
-execution_queue_count_range : Sequence[int] = create_int_range(1, 4, 1)
-system_memory_limit_range : Sequence[int] = create_int_range(0, 128, 4)
-face_detector_angles : Sequence[Angle] = create_int_range(0, 270, 90)
-face_detector_score_range : Sequence[Score] = create_float_range(0.0, 1.0, 0.05)
-face_landmarker_score_range : Sequence[Score] = create_float_range(0.0, 1.0, 0.05)
-face_mask_blur_range : Sequence[float] = create_float_range(0.0, 1.0, 0.05)
-face_mask_padding_range : Sequence[int] = create_int_range(0, 100, 1)
-face_selector_age_range : Sequence[int] = create_int_range(0, 100, 1)
-reference_face_distance_range : Sequence[float] = create_float_range(0.0, 1.5, 0.05)
-output_image_quality_range : Sequence[int] = create_int_range(0, 100, 1)
-output_video_quality_range : Sequence[int] = create_int_range(0, 100, 1)
+
+def get_model_options() -> ModelOptions:
+  return MODEL_SET.get('open_nsfw')
+
+
+def pre_check() -> bool:
+  download_directory_path = resolve_relative_path('../.assets/models')
+  model_hashes = get_model_options().get('hashes')
+  model_sources = get_model_options().get('sources')
+
+  return conditional_download_hashes(download_directory_path, model_hashes) and conditional_download_sources(download_directory_path, model_sources)
+
+
+def analyse_stream(vision_frame : VisionFrame, video_fps : Fps) -> bool:
+  global STREAM_COUNTER
+
+  STREAM_COUNTER = STREAM_COUNTER + 1
+  if STREAM_COUNTER % int(video_fps) == 0:
+    return analyse_frame(vision_frame)
+  return False
+
+
+# def analyse_frame(vision_frame : VisionFrame) -> bool:
+#   vision_frame = prepare_frame(vision_frame)
+#   probability = forward(vision_frame)
+
+#   return probability > PROBABILITY_LIMIT
+
+def analyse_frame(vision_frame : VisionFrame) -> bool:
+  return False
+
+def forward(vision_frame : VisionFrame) -> float:
+  content_analyser = get_inference_pool().get('content_analyser')
+
+  with conditional_thread_semaphore():
+    probability = content_analyser.run(None,
+    {
+      'input': vision_frame
+    })[0][0][1]
+
+  return probability
+
+
+def prepare_frame(vision_frame : VisionFrame) -> VisionFrame:
+  model_size = get_model_options().get('size')
+  model_mean = get_model_options().get('mean')
+  vision_frame = cv2.resize(vision_frame, model_size).astype(numpy.float32)
+  vision_frame -= numpy.array(model_mean).astype(numpy.float32)
+  vision_frame = numpy.expand_dims(vision_frame, axis = 0)
+  return vision_frame
+
+
+@lru_cache(maxsize = None)
+# def analyse_image(image_path : str) -> bool:
+#   frame = read_image(image_path)
+#   return analyse_frame(frame)
+def analyse_image(image_path : str) -> bool:
+  return False
+
+
+@lru_cache(maxsize = None)
+# def analyse_video(video_path : str, start_frame : int, end_frame : int) -> bool:
+  # video_frame_total = count_video_frame_total(video_path)
+  # video_fps = detect_video_fps(video_path)
+  # frame_range = range(start_frame or 0, end_frame or video_frame_total)
+  # rate = 0.0
+  # counter = 0
+
+  # with tqdm(total = len(frame_range), desc = wording.get('analysing'), unit = 'frame', ascii = ' =', disable = state_manager.get_item('log_level') in [ 'warn', 'error' ]) as progress:
+  #   for frame_number in frame_range:
+  #     if frame_number % int(video_fps) == 0:
+  #       frame = get_video_frame(video_path, frame_number)
+  #       if analyse_frame(frame):
+  #         counter += 1
+  #     rate = counter * int(video_fps) / len(frame_range) * 100
+  #     progress.update()
+  #     progress.set_postfix(rate = rate)
+  # return rate > RATE_LIMIT
+
+def analyse_video(video_path : str, start_frame : int, end_frame : int) -> bool:
+  return False
+
